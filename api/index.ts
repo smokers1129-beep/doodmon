@@ -11,15 +11,16 @@ import { envFromRecord } from "../src/env.ts";
 import { handleRequest } from "../src/handler.ts";
 import { createRuntime, type Runtime } from "../src/runtime.ts";
 
-export const config = { runtime: "edge" };
-
-let runtime: Runtime | null = null;
+let appRuntime: Runtime | null = null;
 let initError: Error | null = null;
 
 export default async function handler(request: Request): Promise<Response> {
-  if (!runtime && !initError) {
+  if (!appRuntime && !initError) {
     try {
-      runtime = createRuntime({ config: dropConfig, env: envFromRecord(process.env) });
+      appRuntime = createRuntime({
+        config: dropConfig,
+        env: envFromRecord(process.env),
+      });
     } catch (error) {
       initError = error instanceof Error ? error : new Error(String(error));
     }
@@ -27,13 +28,20 @@ export default async function handler(request: Request): Promise<Response> {
 
   if (initError) {
     return new Response(
-      `${JSON.stringify({ error: "configuration problem", detail: initError.message }, null, 2)}\n`,
+      `${JSON.stringify(
+        { error: "configuration problem", detail: initError.message },
+        null,
+        2,
+      )}\n`,
       {
         status: 500,
-        headers: { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" },
+        headers: {
+          "content-type": "application/json; charset=utf-8",
+          "cache-control": "no-store",
+        },
       },
     );
   }
 
-  return handleRequest(request, runtime as Runtime);
+  return handleRequest(request, appRuntime as Runtime);
 }

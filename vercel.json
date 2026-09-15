@@ -8,11 +8,7 @@
   ],
   "functions": {
     "api/**/*.ts": {
-      "includeFiles": [
-        "drop.config.ts",
-        "src/**",
-        "metadata/**"
-      ]
+      "includeFiles": "drop.config.ts"
     }
   }
 }

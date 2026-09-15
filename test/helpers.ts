@@ -1,0 +1,284 @@
+/**
+ * A fake chain and a fake metadata host, so the tests never touch the network.
+ */
+
+import type { DropConfig } from "../src/config.ts";
+import type { Env } from "../src/env.ts";
+import type { KvLike, RevealStore } from "../src/reveal-store.ts";
+import type { FetchLike } from "../src/rpc.ts";
+import { createRuntime, type Runtime } from "../src/runtime.ts";
+
+export const CONTRACT = "0x1111111111111111111111111111111111111111";
+export const RPC_URL = "https://rpc.test/v2/key";
+export const METADATA_URL = "https://metadata.test/drop";
+
+export type FakeChain = {
+  /** Tokens tokenIdStart..(tokenIdStart + totalSupply - 1) are minted. */
+  totalSupply: number;
+  /**
+   * What `getMintStats` reports as `_totalMinted()`. null mirrors totalSupply,
+   * which is a drop nobody has burned from. Set it higher to model burns.
+   */
+  totalMinted: number | null;
+  /** False makes `getMintStats` revert, as a non-SeaDrop contract would. */
+  supportsMintStats: boolean;
+  /** Make every eth_call fail, to check the fail-closed behaviour. */
+  down: boolean;
+  /** How many JSON-RPC requests have been made. */
+  rpcCalls: number;
+  /** How many metadata fetches have been made. */
+  metadataCalls: number;
+  /** Make the metadata source return a server error, to check the fallback. */
+  metadataDown: boolean;
+  /** Indexes the metadata source answers 404 for, as an unuploaded file would. */
+  metadataMissing: number[];
+  /** Raw hex to answer `ownerOf` with, instead of a well formed word. */
+  ownerOfRaw: string | null;
+  /** Raw hex to answer `totalSupply` with, instead of a well formed word. */
+  totalSupplyRaw: string | null;
+  /** Raw hex to answer `getMintStats` with, instead of three well formed words. */
+  mintStatsRaw: string | null;
+  /** Held open, every eth_call waits on it, so concurrency can be observed. */
+  gate: Promise<void> | null;
+};
+
+export function baseConfig(overrides: Partial<DropConfig> = {}): DropConfig {
+  return {
+    chain: "base",
+    contract: CONTRACT,
+    tokenIdStart: 1,
+    maxSupply: 10,
+    reveal: { mode: "on-mint", shuffle: { enabled: false } },
+    mintState: { mode: "sequential", ttlSeconds: 10 },
+    metadata: { source: "http" },
+    placeholder: {
+      name: "Unrevealed #{tokenId}",
+      description: "not yet",
+      image: "ipfs://placeholder",
+    },
+    ...overrides,
+  };
+}
+
+export function makeFakeFetch(chain: FakeChain): FetchLike {
+  return async (input: string, init?: RequestInit): Promise<Response> => {
+    if (input.startsWith(RPC_URL)) {
+      chain.rpcCalls += 1;
+      if (chain.down) {
+        return jsonResponse(
+          { jsonrpc: "2.0", id: 1, error: { code: -32000, message: "node is having a moment" } },
+          200,
+        );
+      }
+
+      const body = JSON.parse(String(init?.body ?? "{}")) as {
+        id: number;
+        method: string;
+        params: unknown[];
+      };
+
+      if (body.method === "eth_blockNumber") {
+        return jsonResponse({ jsonrpc: "2.0", id: body.id, result: "0x1000" }, 200);
+      }
+
+      if (body.method === "eth_call") {
+        const call = body.params[0] as { data: string };
+        const selector = call.data.slice(0, 10);
+
+        if (chain.gate) await chain.gate;
+
+        if (selector === "0x840e15d4") {
+          if (chain.mintStatsRaw !== null) {
+            return jsonResponse({ jsonrpc: "2.0", id: body.id, result: chain.mintStatsRaw }, 200);
+          }
+          if (!chain.supportsMintStats) {
+            return jsonResponse(
+              {
+                jsonrpc: "2.0",
+                id: body.id,
+                error: { code: 3, message: "execution reverted" },
+              },
+              200,
+            );
+          }
+          const minted = chain.totalMinted ?? chain.totalSupply;
+          // (minterNumMinted, currentTotalSupply, maxSupply)
+          return jsonResponse(
+            {
+              jsonrpc: "2.0",
+              id: body.id,
+              result: `0x${"".padStart(64, "0")}${hexWord(minted).slice(2)}${hexWord(1000).slice(2)}`,
+            },
+            200,
+          );
+        }
+        if (selector === "0x18160ddd") {
+          return jsonResponse(
+            {
+              jsonrpc: "2.0",
+              id: body.id,
+              result: chain.totalSupplyRaw ?? hexWord(chain.totalSupply),
+            },
+            200,
+          );
+        }
+        if (selector === "0x6352211e") {
+          if (chain.ownerOfRaw !== null) {
+            return jsonResponse({ jsonrpc: "2.0", id: body.id, result: chain.ownerOfRaw }, 200);
+          }
+          const tokenId = Number(BigInt(`0x${call.data.slice(10)}`));
+          const minted = tokenId >= 1 && tokenId <= chain.totalSupply;
+          return minted
+            ? jsonResponse(
+                { jsonrpc: "2.0", id: body.id, result: `0x${"22".padStart(64, "0")}` },
+                200,
+              )
+            : jsonResponse(
+                {
+                  jsonrpc: "2.0",
+                  id: body.id,
+                  error: { code: 3, message: "execution reverted", data: "0xdf2d9b42" },
+                },
+                200,
+              );
+        }
+      }
+
+      return jsonResponse({ jsonrpc: "2.0", id: 1, error: { code: -32601, message: "no" } }, 200);
+    }
+
+    if (input.startsWith(METADATA_URL)) {
+      chain.metadataCalls += 1;
+      if (chain.metadataDown) return new Response("upstream is unhappy", { status: 502 });
+      const index = Number(input.slice(input.lastIndexOf("/") + 1).replace(".json", ""));
+      if (!Number.isInteger(index) || index < 0 || index > 999) {
+        return new Response("not found", { status: 404 });
+      }
+      if (chain.metadataMissing.includes(index)) {
+        return new Response("not found", { status: 404 });
+      }
+      return jsonResponse(
+        {
+          name: `Artwork ${index}`,
+          image: `ipfs://art/${index}.png`,
+          attributes: [{ trait_type: "Index", value: index }],
+        },
+        200,
+      );
+    }
+
+    throw new Error(`unexpected fetch to ${input}`);
+  };
+}
+
+export function makeRuntime(
+  options: {
+    config?: Partial<DropConfig>;
+    env?: Partial<Env>;
+    chain?: Partial<FakeChain>;
+    store?: RevealStore;
+  } = {},
+): { runtime: Runtime; chain: FakeChain } {
+  const chain: FakeChain = {
+    totalSupply: 0,
+    totalMinted: null,
+    supportsMintStats: true,
+    down: false,
+    rpcCalls: 0,
+    metadataCalls: 0,
+    metadataDown: false,
+    metadataMissing: [],
+    ownerOfRaw: null,
+    totalSupplyRaw: null,
+    mintStatsRaw: null,
+    gate: null,
+    ...options.chain,
+  };
+
+  const env: Env = {
+    RPC_URL,
+    METADATA_HTTP_BASE_URL: METADATA_URL,
+    ...options.env,
+  };
+
+  const runtime = createRuntime({
+    config: baseConfig(options.config),
+    env,
+    fetchImpl: makeFakeFetch(chain),
+    ...(options.store ? { store: options.store } : {}),
+  });
+
+  return { runtime, chain };
+}
+
+export function get(path: string): Request {
+  return new Request(`https://drop.test${path}`);
+}
+
+function hexWord(value: number): string {
+  return `0x${value.toString(16).padStart(64, "0")}`;
+}
+
+function jsonResponse(body: unknown, status: number): Response {
+  return new Response(JSON.stringify(body), {
+    status,
+    headers: { "content-type": "application/json" },
+  });
+}
+
+/** A KV namespace that records every write, for the coalescing tests. */
+export function makeFakeKv(): KvLike & { writes: string[]; now: number } {
+  const state = {
+    writes: [] as string[],
+    now: 1_000_000,
+    value: null as string | null,
+    async get(_key: string): Promise<string | null> {
+      return state.value;
+    },
+    async put(_key: string, value: string): Promise<void> {
+      state.writes.push(value);
+      state.value = value;
+    },
+  };
+  return state;
+}
+
+/**
+ * A KV namespace whose writes fail until `failingWrites` is turned off, so a
+ * value dropped by a failed write can be looked for afterwards.
+ */
+export function makeFlakyKv(): KvLike & { writes: string[]; failingWrites: boolean } {
+  const state = {
+    writes: [] as string[],
+    failingWrites: true,
+    value: null as string | null,
+    async get(_key: string): Promise<string | null> {
+      return state.value;
+    },
+    async put(_key: string, value: string): Promise<void> {
+      if (state.failingWrites) throw new Error("kv is having a moment");
+      state.writes.push(value);
+      state.value = value;
+    },
+  };
+  return state;
+}
+
+/**
+ * A store that records nothing and fails every write, so a reveal that still
+ * happens can only have come from the reader's own in-memory mark.
+ */
+export function makeBrokenStore(): RevealStore {
+  return {
+    kind: "broken",
+    async getHighWater() {
+      return null;
+    },
+    async bumpHighWater() {
+      throw new Error("shared store is unavailable");
+    },
+    describe() {
+      return "a store that always fails";
+    },
+  };
+}
